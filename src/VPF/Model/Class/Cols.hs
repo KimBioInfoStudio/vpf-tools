@@ -30,6 +30,8 @@ declareColumn "host_cat"       ''Int
 declareColumn "host_fam_class" ''Text
 declareColumn "host_fam_cat"   ''Int
 
+declareColumn "genus_class" ''Text
+
 type RawClassificationCols =
     '[ ModelName
      , BaltClass
@@ -40,6 +42,7 @@ type RawClassificationCols =
      , HostCat
      , HostFamClass
      , HostFamCat
+     , GenusClass
      ]
 
 type RawClassification = Record RawClassificationCols
@@ -64,6 +67,7 @@ type ClassificationCols =
      , Fam
      , Host
      , HostFam
+     , GenusClass
      ]
 
 type Classification = Record ClassificationCols
@@ -103,6 +107,7 @@ fromRawClassification rc
     :& #fam      =: mkClass (rc^.famClass)     (rc^.famCat)
     :& #host     =: mkClass (rc^.hostClass)    (rc^.hostCat)
     :& #host_fam =: mkClass (rc^.hostFamClass) (rc^.hostFamCat)
+    :& rc ^. rlens @GenusClass
     :& RNil
 
 toRawClassification :: Classification -> RawClassification
@@ -116,5 +121,6 @@ toRawClassification cls
     :& #host_cat       =: classCat  (cls^.host)
     :& #host_fam_class =: className (cls^.hostFam)
     :& #host_fam_cat   =: classCat  (cls^.hostFam)
+    :& cls ^. rlens @GenusClass
     :& RNil
 
