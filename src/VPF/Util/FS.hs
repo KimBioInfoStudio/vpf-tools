@@ -90,14 +90,16 @@ lineReader get = loop
       line <- liftIO (try get)
 
       case line of
-        Right t -> P.yield t >> loop
+        Right t -> do
+          P.yield t
+          loop
 
         Left e | IO.isEOFError e -> return ()
                | otherwise       -> P.throwM e
 
 
 stdinReader :: (MonadIO m, MonadCatch m) => Producer Text m ()
-stdinReader = lineReader (liftIO TIO.getLine)
+stdinReader = lineReader TIO.getLine
 
 fileReader :: P.MonadSafe m => FilePath -> Producer Text m ()
 fileReader fp =
@@ -105,10 +107,10 @@ fileReader fp =
         lineReader . TIO.hGetLine
 
 
-stdoutWriter :: MonadIO m => Consumer Text m ()
+stdoutWriter :: MonadIO m => Consumer Text m r
 stdoutWriter = P.mapM_ (liftIO . TIO.putStrLn)
 
-fileWriter :: P.MonadSafe m => FilePath -> Consumer Text m ()
+fileWriter :: P.MonadSafe m => FilePath -> Consumer Text m r
 fileWriter fp =
     P.withFile fp IO.WriteMode $ \h ->
         forever $ do

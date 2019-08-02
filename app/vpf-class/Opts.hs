@@ -1,5 +1,6 @@
 {-# language ApplicativeDo #-}
 {-# language RecordWildCards #-}
+{-# language StrictData #-}
 module Opts where
 
 import Control.Concurrent (getNumCapabilities)
@@ -7,12 +8,12 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Options.Applicative
 
+import qualified Control.Distributed.MPI.Store  as MPI
+
 import VPF.Formats
 import VPF.Ext.HMMER (HMMERConfig(HMMERConfig))
 import VPF.Ext.HMMER.Search (ProtSearchHitCols)
 import VPF.Model.Class (RawClassificationCols)
-
-import qualified VPF.Model.VirusClass as VC
 
 
 data ArgPath t = FSPath (Path t) | StdDevice
@@ -27,6 +28,13 @@ data InputFiles =
     GivenSequences { vpfsFile :: Path HMMERModel, genomesFile :: Path (FASTA Nucleotide) }
   | GivenHitsFile { hitsFile :: Path (HMMERTable ProtSearchHitCols) }
 
+data ConcurrencyOpts = ConcurrencyOpts
+  { fastaChunkSize :: Int
+  , numWorkers :: Int
+  , useMPI :: Bool
+  }
+
+
 
 data Config outfmt = Config
   { hmmerConfig     :: HMMERConfig
@@ -37,7 +45,7 @@ data Config outfmt = Config
   , vpfClassFile    :: Path (DSV "\t" RawClassificationCols)
   , outputFile      :: ArgPath outfmt
   , workDir         :: Maybe (Path Directory)
-  , concurrencyOpts :: VC.ConcurrencyOpts
+  , concurrencyOpts :: ConcurrencyOpts
   }
 
 
@@ -48,18 +56,19 @@ argPathReader = maybeReader $ \s ->
       _   -> Just (FSPath (Tagged s))
 
 
-defaultConcurrencyOpts :: IO VC.ConcurrencyOpts
-defaultConcurrencyOpts = do
-    maxSearchingWorkers <- getNumCapabilities
+defaultConcurrencyOpts :: [MPI.Rank] -> IO ConcurrencyOpts
+defaultConcurrencyOpts slaves = do
+    numWorkers <- getNumCapabilities
     let fastaChunkSize = 1
+    let useMPI = False
 
-    return VC.ConcurrencyOpts {..}
+    return ConcurrencyOpts {..}
 
 
-configParserIO :: IO (Parser (Config outfmt))
-configParserIO = fmap configParser defaultConcurrencyOpts
+configParserIO :: [MPI.Rank] -> IO (Parser (Config outfmt))
+configParserIO = fmap configParser . defaultConcurrencyOpts
 
-configParser :: VC.ConcurrencyOpts -> Parser (Config outfmt)
+configParser :: ConcurrencyOpts -> Parser (Config outfmt)
 configParser defConcOpts = do
     prodigalPath <- strOption $
         long "prodigal"
@@ -148,22 +157,28 @@ configParser defConcOpts = do
       pure GivenHitsFile {..}
 
 
-    concOpts :: Parser VC.ConcurrencyOpts
+    concOpts :: Parser ConcurrencyOpts
     concOpts = do
-      maxSearchingWorkers <- option auto $
+      numWorkers <- option auto $
           long "workers"
           <> metavar "NW"
-          <> value (VC.maxSearchingWorkers defConcOpts)
+          <> value (numWorkers defConcOpts)
           <> hidden
           <> showDefault
-          <> help "Number of parallel workers (prodigal/hmmsearch) processing the FASTA file"
+          <> help "Number of parallel workers processing the FASTA file"
 
       fastaChunkSize <- option auto $
           long "chunk-size"
           <> metavar "CHUNK_SZ"
-          <> value (VC.fastaChunkSize defConcOpts)
+          <> value (fastaChunkSize defConcOpts)
           <> hidden
           <> showDefault
           <> help "Number of sequences to be processed at once by each parallel worker"
 
-      pure VC.ConcurrencyOpts {..}
+      useMPI <- switch $
+          long "mpi"
+          <> hidden
+          <> showDefault
+          <> help "Enable MPI mode"
+
+      pure ConcurrencyOpts {..}

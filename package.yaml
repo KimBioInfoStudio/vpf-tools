@@ -22,8 +22,8 @@ dependencies:
 - base >= 4.7 && < 5
 - Frames
 - array
-- async
 - bytestring
+- constraints
 - containers
 - directory
 - exceptions
@@ -31,8 +31,10 @@ dependencies:
 - filepath
 - foldl
 - lens
+- lifted-async
 - mmorph
 - monad-control
+- mpi-hs
 - optparse-applicative
 - pipes
 - pipes-concurrency
@@ -42,6 +44,9 @@ dependencies:
 - primitive
 - regex-base
 - regex-pcre-builtin
+- semigroupoids
+- stm
+- store
 - tagged
 - temporary
 - text
@@ -79,6 +84,16 @@ executables:
   vpf-class:
     main:                Main.hs
     source-dirs:         app/vpf-class
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - vpf-tools
+
+  mpi-test:
+    main:                Main.hs
+    source-dirs:         app/mpi-test
     ghc-options:
     - -threaded
     - -rtsopts
