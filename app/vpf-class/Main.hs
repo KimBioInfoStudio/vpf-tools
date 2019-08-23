@@ -10,23 +10,24 @@ import Control.Eff.Exception (Exc, runError, Fail, die, runFail)
 import Control.Lens (Lens, view, over, mapped, (&))
 import Control.Monad ((<=<))
 import qualified Control.Monad.Catch as MC
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO(liftIO))
 import Control.Monad.Trans.Control (StM, liftBaseWith, restoreM)
-
-import qualified Data.List.NonEmpty as NE
 
 import qualified Data.Array                 as Array
 import qualified Data.ByteString            as BS
 import Data.Foldable (toList)
 import Data.Maybe (fromMaybe, listToMaybe)
+import qualified Data.List.NonEmpty as NE
 import Data.Text (Text)
 import qualified Data.Text.Encoding         as T
 import qualified Text.Regex.Base            as PCRE
 import qualified Text.Regex.PCRE.ByteString as PCRE
 
-import qualified Options.Applicative as OptP
+import qualified System.Directory as D
+import System.Exit (exitFailure)
+import qualified System.IO as IO
 
-import System.Exit (exitWith, ExitCode(..))
+import qualified Options.Applicative as OptP
 
 import Frames (FrameRec, Record)
 
@@ -56,8 +57,6 @@ import qualified Pipes.Core    as P
 import qualified Pipes.Prelude as P
 import qualified Pipes.Safe    as PS
 
-import qualified System.Directory as D
-
 import qualified Opts
 
 
@@ -85,6 +84,18 @@ tagsClassify :: Conc.JobTags Int Int
 tagsClassify = Conc.JobTags (Conc.JobTagIn 0) (Conc.JobTagOut 0)
 
 
+putErrLn :: MonadIO m => String -> m ()
+putErrLn = liftIO . IO.hPutStrLn IO.stderr
+
+mpiAbortWith :: Int -> String -> IO a
+mpiAbortWith ec msg = do
+  IO.hFlush IO.stdout
+  IO.hPutStrLn IO.stderr msg
+  IO.hFlush IO.stderr
+  MPI.abort MPI.commWorld ec
+  exitFailure
+
+
 main :: IO ()
 main = MPI.mainMPI $ do
     let comm = MPI.commWorld
@@ -97,24 +108,22 @@ main = MPI.mainMPI $ do
 
     case MPI.fromRank rank of
       0 -> do
-          result <- masterClassify cfg slaves `MC.catch` \e -> do
-            print (e :: MC.SomeException)
-            MPI.abort comm 1
-            exitWith (ExitFailure 1)
+          result <- masterClassify cfg slaves `MC.catch` \(e :: MC.SomeException) -> do
+                      putErrLn "exception was caught in master task"
+                      mpiAbortWith 2 (show e)
 
           case result of
             Just _  -> return ()
-            Nothing -> MPI.abort comm 1
+            Nothing -> mpiAbortWith 1 "errors were produced in master task, aborting"
 
       r -> do
-          result <- slaveClassify cfg r slaves `MC.catch` \e -> do
-            print (e :: MC.SomeException)
-            MPI.abort comm 1
-            exitWith (ExitFailure 1)
+          result <- slaveClassify cfg r slaves `MC.catch` \(e :: MC.SomeException) -> do
+                      putErrLn "exception was caught in slave task"
+                      mpiAbortWith 4 (show e)
 
           case result of
             Just _  -> return ()
-            Nothing -> MPI.abort comm 1
+            Nothing -> mpiAbortWith 3 "errors were produced in slave task, aborting"
   where
     opts parser = OptP.info (parser <**> OptP.helper) $
         OptP.fullDesc
@@ -129,7 +138,7 @@ compileRegex src = do
                                (T.encodeUtf8 src)
     case erx of
       Left (_, err) -> do
-          lift $ putStrLn $ "Could not compile the regex " ++ show src ++ ": " ++ err
+          putErrLn $ "Could not compile the regex " ++ show src ++ ": " ++ err
           die
 
       Right rx -> return $ \text -> do
@@ -177,6 +186,9 @@ masterClassify cfg slaves =
                 PS.runSafeT $
                   DSV.writeDSV tsvOpts (FS.fileWriter (untag fp)) rawPredictedCls
   where
+    nworkers :: Int
+    nworkers = max 1 $ Opts.numWorkers (Opts.concurrencyOpts cfg)
+
     buildConcOpts :: Path Directory
                   -> Path HMMERModel
                   -> ClassifyM (VC.ConcurrencyOpts ClassifyM)
@@ -184,18 +196,22 @@ masterClassify cfg slaves =
         liftBaseWith $ \runInIO -> return VC.ConcurrencyOpts
             { VC.fastaChunkSize =
                 Opts.fastaChunkSize (Opts.concurrencyOpts cfg)
-                  * length slaves
+                  * nworkers
+
             , VC.pipelineWorkers =
                 if Opts.useMPI (Opts.concurrencyOpts cfg) && not (null slaves) then
-                    let mapStM f = runInIO . fmap f . restoreM in
-                    fmap (Conc.workerToPipe . Conc.mapWorkerIO (mapStM D.fromFrameRowStoreRec)) $
-                      Conc.mpiWorkers (NE.fromList slaves) tagsClassify MPI.commWorld
+                  let
+                    mpiWorkers = Conc.mpiWorkers (NE.fromList slaves) tagsClassify MPI.commWorld
+                    mapStM f = runInIO . fmap f . restoreM
+                    asDeserialized = Conc.mapWorkerIO (mapStM D.fromFrameRowStoreRec)
+                  in
+                    fmap (Conc.workerToPipe . asDeserialized) mpiWorkers
                 else
-                  Conc.replicate1
-                    (fromIntegral $ Opts.numWorkers (Opts.concurrencyOpts cfg))
-                    (P.mapM (\chunk -> liftIO $ runInIO $ do
-                        hitsFile <- VC.searchGenomeHits workDir vpfsFile (P.each chunk)
-                        VC.processHMMOut hitsFile))
+                  let
+                    workerBody chunk = liftIO $ runInIO $
+                        VC.syncPipeline workDir vpfsFile (P.each chunk)
+                  in
+                    Conc.replicate1 (fromIntegral nworkers) (P.mapM workerBody)
             }
 
 
@@ -208,20 +224,24 @@ slaveClassify cfg rank slaves =
             case Opts.inputFiles cfg of
               Opts.GivenHitsFile hitsFile -> return ()
 
-              Opts.GivenSequences vpfsFile genomesFile ->
+              Opts.GivenSequences vpfsFile _ ->
                   withCfgWorkDir cfg $ \workDir ->
                   withProdigalCfg cfg $
                   withHMMSearchCfg cfg $
-                  handleFastaParseErrors $ do
-                    concOpts <- buildConcOpts workDir vpfsFile
-
-                    liftBaseWith $ \runInIO ->
-                      PS.runSafeT $
-                        Conc.makeProcessWorker MPI.rootRank tagsClassify MPI.commWorld $ \chunk ->
-                          liftIO $ runInIO $
-                            fmap D.toFrameRowStoreRec $
-                              VC.asyncPipeline (fmap Right $ P.each chunk) concOpts
+                  handleFastaParseErrors $
+                    worker workDir vpfsFile
   where
+    worker :: Path Directory -> Path HMMERModel -> ClassifyM ()
+    worker workDir vpfsFile = do
+      concOpts <- buildConcOpts workDir vpfsFile
+
+      liftBaseWith $ \runInIO ->
+          PS.runSafeT $
+            Conc.makeProcessWorker MPI.rootRank tagsClassify MPI.commWorld $ \chunk ->
+                liftIO $ runInIO $
+                  fmap D.toFrameRowStoreRec $
+                    VC.asyncPipeline (fmap Right $ P.each chunk) concOpts
+
     buildConcOpts :: Path Directory
                   -> Path HMMERModel
                   -> ClassifyM (VC.ConcurrencyOpts ClassifyM)
@@ -229,12 +249,15 @@ slaveClassify cfg rank slaves =
       liftBaseWith $ \runInIO -> return VC.ConcurrencyOpts
           { VC.fastaChunkSize =
               Opts.fastaChunkSize (Opts.concurrencyOpts cfg)
+
           , VC.pipelineWorkers =
-              Conc.replicate1
-                (fromIntegral $ Opts.numWorkers (Opts.concurrencyOpts cfg))
-                (P.mapM (\chunk -> liftIO $ runInIO $ do
-                    hitsFile <- VC.searchGenomeHits workDir vpfsFile (P.each chunk)
-                    VC.processHMMOut hitsFile))
+              let
+                nworkers = max 1 $ Opts.numWorkers (Opts.concurrencyOpts cfg)
+
+                workerBody chunk = liftIO $ runInIO $
+                    VC.syncPipeline workDir vpfsFile (P.each chunk)
+              in
+                Conc.replicate1 (fromIntegral nworkers) (P.mapM workerBody)
           }
 
 
@@ -281,7 +304,7 @@ withProdigalCfg cfg m = do
         case res of
           Right a -> return a
           Left e -> do
-            lift $ putStrLn $ "prodigal error: " ++ show e
+            putErrLn $ "prodigal error: " ++ show e
             die
 
 
@@ -302,7 +325,7 @@ withHMMSearchCfg cfg m = do
         case res of
           Right a -> return a
           Left e -> do
-            lift $ putStrLn $ "hmmsearch error: " ++ show e
+            putErrLn $ "hmmsearch error: " ++ show e
             die
 
 
@@ -316,18 +339,15 @@ handleFastaParseErrors m = do
       Right a -> return a
 
       Left (FA.ExpectedNameLine found) -> do
-        lift $ putStrLn $
-          "FASTA parsing error: expected name line but found " ++ show found
+        putErrLn $ "FASTA parsing error: expected name line but found " ++ show found
         die
 
       Left (FA.ExpectedSequenceLine []) -> do
-        lift $ putStrLn $
-          "FASTA parsing error: expected sequence but found EOF"
+        putErrLn $ "FASTA parsing error: expected sequence but found EOF"
         die
 
       Left (FA.ExpectedSequenceLine (l:_)) -> do
-        lift $ putStrLn $
-          "FASTA parsing error: expected sequence but found " ++ show l
+        putErrLn $ "FASTA parsing error: expected sequence but found " ++ show l
         die
 
 
@@ -340,7 +360,6 @@ handleDSVParseErrors m = do
     case res of
       Right a -> return a
       Left (DSV.ParseError ctx row) -> do
-        lift $ do
-          putStrLn $ "could not parse row " ++ show row
-          putStrLn $ " within " ++ show ctx
+        putErrLn $ "DSV parse error in " ++ show ctx ++ ": "
+                     ++ "could not parse row " ++ show row
         die
